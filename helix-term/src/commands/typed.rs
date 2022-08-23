@@ -1070,6 +1070,40 @@ fn show_clipboard_provider(
     Ok(())
 }
 
+fn change_directory_impl(cx: &mut compositor::Context, dir: &Path) -> anyhow::Result<()> {
+    helix_loader::set_current_working_dir(dir)?;
+
+    cx.editor.set_status(format!(
+        "Current working directory is now {}",
+        helix_loader::current_working_dir().display()
+    ));
+
+    Ok(())
+}
+
+fn change_directory_to_current_file(
+    cx: &mut compositor::Context,
+    _args: &[Cow<str>],
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    let (_, doc) = current_ref!(cx.editor);
+    let dir = match doc.path() {
+        Some(path) => path
+            .parent()
+            .map(ToOwned::to_owned)
+            .context("Couldn't get parent of current document")?,
+        None => {
+            bail!("Current document has no path");
+        }
+    };
+
+    change_directory_impl(cx, &dir)
+}
+
 fn change_current_directory(
     cx: &mut compositor::Context,
     args: &[Cow<str>],
@@ -1086,13 +1120,7 @@ fn change_current_directory(
             .as_ref(),
     );
 
-    helix_loader::set_current_working_dir(dir)?;
-
-    cx.editor.set_status(format!(
-        "Current working directory is now {}",
-        helix_loader::current_working_dir().display()
-    ));
-    Ok(())
+    change_directory_impl(cx, &dir)
 }
 
 fn show_current_directory(
@@ -2792,6 +2820,13 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         aliases: &["cd"],
         doc: "Change the current working directory.",
         fun: change_current_directory,
+        signature: CommandSignature::positional(&[completers::directory]),
+    },
+    TypableCommand {
+        name: "change-directory-to-current-file",
+        aliases: &["cdf"],
+        doc: "Change the current working directory to the parent of the current file.",
+        fun: change_directory_to_current_file,
         signature: CommandSignature::positional(&[completers::directory]),
     },
     TypableCommand {
