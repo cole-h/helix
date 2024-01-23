@@ -7,7 +7,7 @@ use super::*;
 
 use helix_core::fuzzy::fuzzy_match;
 use helix_core::indent::MAX_INDENT;
-use helix_core::{encoding, line_ending, path::get_canonicalized_path, shellwords::Shellwords};
+use helix_core::{encoding, line_ending, shellwords::Shellwords};
 use helix_lsp::{OffsetEncoding, Url};
 use helix_view::document::DEFAULT_LANGUAGE_NAME;
 use helix_view::editor::{Action, CloseError, ConfigEvent};
@@ -111,7 +111,7 @@ fn open(cx: &mut compositor::Context, args: &[Cow<str>], event: PromptEvent) -> 
     ensure!(!args.is_empty(), "wrong argument count");
     for arg in args {
         let (path, pos) = args::parse_file(arg);
-        let path = helix_core::path::expand_tilde(&path);
+        let path = helix_stdx::path::expand_tilde(&path);
         // If the path is a directory, open a file picker on that directory and update the status
         // message
         if let Ok(true) = std::fs::canonicalize(&path).map(|p| p.is_dir()) {
@@ -483,7 +483,7 @@ fn set_indent_style(
     }
 
     // Attempt to parse argument as an indent style.
-    let style = match args.get(0) {
+    let style = match args.first() {
         Some(arg) if "tabs".starts_with(&arg.to_lowercase()) => Some(Tabs),
         Some(Cow::Borrowed("0")) => Some(Tabs),
         Some(arg) => arg
@@ -535,7 +535,7 @@ fn set_line_ending(
     }
 
     let arg = args
-        .get(0)
+        .first()
         .context("argument missing")?
         .to_ascii_lowercase();
 
@@ -1071,11 +1071,11 @@ fn show_clipboard_provider(
 }
 
 fn change_directory_impl(cx: &mut compositor::Context, dir: &Path) -> anyhow::Result<()> {
-    helix_loader::set_current_working_dir(dir)?;
+    helix_stdx::env::set_current_working_dir(dir)?;
 
     cx.editor.set_status(format!(
         "Current working directory is now {}",
-        helix_loader::current_working_dir().display()
+        helix_stdx::env::current_working_dir().display()
     ));
 
     Ok(())
@@ -1113,10 +1113,9 @@ fn change_current_directory(
         return Ok(());
     }
 
-    let dir = helix_core::path::expand_tilde(
+    let dir = helix_stdx::path::expand_tilde(
         args.first()
             .context("target directory not provided")?
-            .as_ref()
             .as_ref(),
     );
 
@@ -1132,7 +1131,7 @@ fn show_current_directory(
         return Ok(());
     }
 
-    let cwd = helix_loader::current_working_dir();
+    let cwd = helix_stdx::env::current_working_dir();
     let message = format!("Current working directory is {}", cwd.display());
 
     if cwd.exists() {
@@ -2106,7 +2105,7 @@ fn reflow(
     //   - The configured text-width for this language in languages.toml
     //   - The configured text-width in the config.toml
     let text_width: usize = args
-        .get(0)
+        .first()
         .map(|num| num.parse::<usize>())
         .transpose()?
         .or_else(|| doc.language_config().and_then(|config| config.text_width))
@@ -2145,11 +2144,7 @@ fn tree_sitter_subtree(
         let text = doc.text();
         let from = text.char_to_byte(primary_selection.from());
         let to = text.char_to_byte(primary_selection.to());
-        if let Some(selected_node) = syntax
-            .tree()
-            .root_node()
-            .descendant_for_byte_range(from, to)
-        {
+        if let Some(selected_node) = syntax.descendant_for_byte_range(from, to) {
             let mut contents = String::from("```tsq\n");
             helix_core::syntax::pretty_print_tree(&mut contents, selected_node)?;
             contents.push_str("\n```");
@@ -2441,7 +2436,8 @@ fn move_buffer(
     ensure!(args.len() == 1, format!(":move takes one argument"));
     let doc = doc!(cx.editor);
 
-    let new_path = get_canonicalized_path(&PathBuf::from(args.first().unwrap().to_string()));
+    let new_path =
+        helix_stdx::path::canonicalize(&PathBuf::from(args.first().unwrap().to_string()));
     let old_path = doc
         .path()
         .ok_or_else(|| anyhow!("Scratch buffer cannot be moved. Use :write instead"))?

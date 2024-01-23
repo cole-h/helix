@@ -1,6 +1,8 @@
 # Language support configuration.
 # See the languages documentation: https://docs.helix-editor.com/master/languages.html
 
+use-grammars = { except = [ "hare", "wren", "gemini" ] }
+
 [language-server]
 
 als = { command = "als" }
@@ -794,6 +796,7 @@ file-types = [
   "sh",
   "bash",
   "zsh",
+  ".bash_history",
   ".bash_login",
   ".bash_logout",
   ".bash_profile",
@@ -1117,7 +1120,7 @@ name = "purescript"
 scope = "source.purescript"
 injection-regex = "purescript"
 file-types = ["purs"]
-roots = ["spago.dhall", "bower.json"]
+roots = ["spago.yaml", "spago.dhall", "bower.json"]
 comment-token = "--"
 language-servers = [ "purescript-language-server" ]
 indent = { tab-width = 2, unit = "  " }
@@ -1391,7 +1394,7 @@ language-servers = [ "metals" ]
 
 [[grammar]]
 name = "scala"
-source = { git = "https://github.com/tree-sitter/tree-sitter-scala", rev = "23d21310fe4ab4b3273e7a6810e781224a3e7fe1" }
+source = { git = "https://github.com/tree-sitter/tree-sitter-scala", rev = "7891815f42dca9ed6aeb464c2edc39d479ab965c" }
 
 [[language]]
 name = "dockerfile"
@@ -2862,7 +2865,7 @@ indent = { tab-width = 2, unit = "  " }
 
 [[grammar]]
 name = "typst"
-source = { git = "https://github.com/uben0/tree-sitter-typst", rev = "e35aa22395fdde82bbc4b5700c324ce346dfc9e5" }
+source = { git = "https://github.com/uben0/tree-sitter-typst", rev = "ecf8596336857adfcd5f7cbb3b2aa11a67badc37" }
 
 [[language]]
 name = "nunjucks"
