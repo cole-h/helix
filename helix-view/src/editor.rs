@@ -1,6 +1,9 @@
 use crate::{
     align_view,
-    document::{DocumentSavedEventFuture, DocumentSavedEventResult, Mode, SavePoint},
+    annotations::diagnostics::{DiagnosticFilter, InlineDiagnosticsConfig},
+    document::{
+        DocumentOpenError, DocumentSavedEventFuture, DocumentSavedEventResult, Mode, SavePoint,
+    },
     graphics::{CursorKind, Rect},
     handlers::Handlers,
     info::Info,
@@ -16,14 +19,15 @@ use helix_vcs::DiffProviderRegistry;
 
 use futures_util::stream::select_all::SelectAll;
 use futures_util::{future, StreamExt};
-use helix_lsp::Call;
+use helix_lsp::{Call, LanguageServerId};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use std::{
     borrow::Cow,
     cell::Cell,
-    collections::{BTreeMap, HashMap},
-    io::stdin,
+    collections::{BTreeMap, HashMap, HashSet},
+    fs,
+    io::{self, stdin},
     num::NonZeroUsize,
     path::{Path, PathBuf},
     pin::Pin,
@@ -41,14 +45,20 @@ pub use helix_core::diagnostic::Severity;
 use helix_core::{
     auto_pairs::AutoPairs,
     syntax::{self, AutoPairConfig, IndentationHeuristic, LanguageServerFeature, SoftWrap},
-    Change, LineEnding, Position, Selection, NATIVE_LINE_ENDING,
+    Change, LineEnding, Position, Range, Selection, Uri, NATIVE_LINE_ENDING,
 };
 use helix_dap as dap;
 use helix_lsp::lsp;
+use helix_stdx::path::canonicalize;
 
 use serde::{ser::SerializeMap, Deserialize, Deserializer, Serialize, Serializer};
 
-use arc_swap::access::{DynAccess, DynGuard};
+use arc_swap::{
+    access::{DynAccess, DynGuard},
+    ArcSwap,
+};
+
+pub const DEFAULT_AUTO_SAVE_DELAY: u64 = 3000;
 
 fn deserialize_duration_millis<'de, D>(deserializer: D) -> Result<Duration, D::Error>
 where
@@ -207,6 +217,31 @@ impl Default for FilePickerConfig {
     }
 }
 
+fn serialize_alphabet<S>(alphabet: &[char], serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let alphabet: String = alphabet.iter().collect();
+    serializer.serialize_str(&alphabet)
+}
+
+fn deserialize_alphabet<'de, D>(deserializer: D) -> Result<Vec<char>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    let str = String::deserialize(deserializer)?;
+    let chars: Vec<_> = str.chars().collect();
+    let unique_chars: HashSet<_> = chars.iter().copied().collect();
+    if unique_chars.len() != chars.len() {
+        return Err(<D::Error as Error>::custom(
+            "jump-label-alphabet must contain unique characters",
+        ));
+    }
+    Ok(chars)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
 pub struct Config {
@@ -236,8 +271,11 @@ pub struct Config {
     pub auto_completion: bool,
     /// Automatic formatting on save. Defaults to true.
     pub auto_format: bool,
-    /// Automatic save on focus lost. Defaults to false.
-    pub auto_save: bool,
+    /// Automatic save on focus lost and/or after delay.
+    /// Time delay in milliseconds since last edit after which auto save timer triggers.
+    /// Time delay defaults to false with 3000ms delay. Focus lost defaults to false.
+    #[serde(deserialize_with = "deserialize_auto_save")]
+    pub auto_save: AutoSave,
     /// Set a global text_width
     pub text_width: usize,
     /// Time in milliseconds since last keypress before idle timers trigger.
@@ -300,6 +338,15 @@ pub struct Config {
     /// Which indent heuristic to use when a new line is inserted
     #[serde(default)]
     pub indent_heuristic: IndentationHeuristic,
+    /// labels characters used in jumpmode
+    #[serde(
+        serialize_with = "serialize_alphabet",
+        deserialize_with = "deserialize_alphabet"
+    )]
+    pub jump_label_alphabet: Vec<char>,
+    /// Display diagnostic below the line they occur.
+    pub inline_diagnostics: InlineDiagnosticsConfig,
+    pub end_of_line_diagnostics: DiagnosticFilter,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, Eq, PartialOrd, Ord)]
@@ -329,7 +376,7 @@ pub struct TerminalConfig {
 
 #[cfg(windows)]
 pub fn get_terminal_provider() -> Option<TerminalConfig> {
-    use crate::env::binary_exists;
+    use helix_stdx::env::binary_exists;
 
     if binary_exists("wt") {
         return Some(TerminalConfig {
@@ -350,9 +397,9 @@ pub fn get_terminal_provider() -> Option<TerminalConfig> {
     })
 }
 
-#[cfg(not(any(windows, target_os = "wasm32")))]
+#[cfg(not(any(windows, target_arch = "wasm32")))]
 pub fn get_terminal_provider() -> Option<TerminalConfig> {
-    use crate::env::{binary_exists, env_var_is_set};
+    use helix_stdx::env::{binary_exists, env_var_is_set};
 
     if env_var_is_set("TMUX") && binary_exists("tmux") {
         return Some(TerminalConfig {
@@ -481,6 +528,9 @@ pub enum StatusLineElement {
 
     /// The relative file path
     FileName,
+
+    /// The file absolute path
+    FileAbsolutePath,
 
     // The file modification indicator
     FileModificationIndicator,
@@ -674,6 +724,7 @@ pub enum WhitespaceRender {
         default: Option<WhitespaceRenderValue>,
         space: Option<WhitespaceRenderValue>,
         nbsp: Option<WhitespaceRenderValue>,
+        nnbsp: Option<WhitespaceRenderValue>,
         tab: Option<WhitespaceRenderValue>,
         newline: Option<WhitespaceRenderValue>,
     },
@@ -705,6 +756,14 @@ impl WhitespaceRender {
             }
         }
     }
+    pub fn nnbsp(&self) -> WhitespaceRenderValue {
+        match *self {
+            Self::Basic(val) => val,
+            Self::Specific { default, nnbsp, .. } => {
+                nnbsp.or(default).unwrap_or(WhitespaceRenderValue::None)
+            }
+        }
+    }
     pub fn tab(&self) -> WhitespaceRenderValue {
         match *self {
             Self::Basic(val) => val,
@@ -723,11 +782,67 @@ impl WhitespaceRender {
     }
 }
 
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct AutoSave {
+    /// Auto save after a delay in milliseconds. Defaults to disabled.
+    #[serde(default)]
+    pub after_delay: AutoSaveAfterDelay,
+    /// Auto save on focus lost. Defaults to false.
+    #[serde(default)]
+    pub focus_lost: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutoSaveAfterDelay {
+    #[serde(default)]
+    /// Enable auto save after delay. Defaults to false.
+    pub enable: bool,
+    #[serde(default = "default_auto_save_delay")]
+    /// Time delay in milliseconds. Defaults to [DEFAULT_AUTO_SAVE_DELAY].
+    pub timeout: u64,
+}
+
+impl Default for AutoSaveAfterDelay {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            timeout: DEFAULT_AUTO_SAVE_DELAY,
+        }
+    }
+}
+
+fn default_auto_save_delay() -> u64 {
+    DEFAULT_AUTO_SAVE_DELAY
+}
+
+fn deserialize_auto_save<'de, D>(deserializer: D) -> Result<AutoSave, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize, Serialize)]
+    #[serde(untagged, deny_unknown_fields, rename_all = "kebab-case")]
+    enum AutoSaveToml {
+        EnableFocusLost(bool),
+        AutoSave(AutoSave),
+    }
+
+    match AutoSaveToml::deserialize(deserializer)? {
+        AutoSaveToml::EnableFocusLost(focus_lost) => Ok(AutoSave {
+            focus_lost,
+            ..Default::default()
+        }),
+        AutoSaveToml::AutoSave(auto_save) => Ok(auto_save),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WhitespaceCharacters {
     pub space: char,
     pub nbsp: char,
+    pub nnbsp: char,
     pub tab: char,
     pub tabpad: char,
     pub newline: char,
@@ -738,6 +853,7 @@ impl Default for WhitespaceCharacters {
         Self {
             space: '·',   // U+00B7
             nbsp: '⍽',    // U+237D
+            nnbsp: '␣',   // U+2423
             tab: '→',     // U+2192
             newline: '⏎', // U+23CE
             tabpad: ' ',
@@ -831,7 +947,7 @@ impl Default for Config {
             auto_pairs: AutoPairConfig::default(),
             auto_completion: true,
             auto_format: true,
-            auto_save: false,
+            auto_save: AutoSave::default(),
             idle_timeout: Duration::from_millis(250),
             completion_timeout: Duration::from_millis(250),
             preview_completion_insert: true,
@@ -862,6 +978,9 @@ impl Default for Config {
             smart_tab: Some(SmartTabConfig::default()),
             popup_border: PopupBorderConfig::None,
             indent_heuristic: IndentationHeuristic::default(),
+            jump_label_alphabet: ('a'..='z').collect(),
+            inline_diagnostics: InlineDiagnosticsConfig::default(),
+            end_of_line_diagnostics: DiagnosticFilter::Disable,
         }
     }
 }
@@ -909,14 +1028,14 @@ pub struct Editor {
     pub macro_recording: Option<(char, Vec<KeyEvent>)>,
     pub macro_replaying: Vec<char>,
     pub language_servers: helix_lsp::Registry,
-    pub diagnostics: BTreeMap<lsp::Url, Vec<(lsp::Diagnostic, usize)>>,
+    pub diagnostics: BTreeMap<Uri, Vec<(lsp::Diagnostic, LanguageServerId)>>,
     pub diff_providers: DiffProviderRegistry,
 
     pub debugger: Option<dap::Client>,
     pub debugger_events: SelectAll<UnboundedReceiverStream<dap::Payload>>,
     pub breakpoints: HashMap<PathBuf, Vec<Breakpoint>>,
 
-    pub syn_loader: Arc<syntax::Loader>,
+    pub syn_loader: Arc<ArcSwap<syntax::Loader>>,
     pub theme_loader: Arc<theme::Loader>,
     /// last_theme is used for theme previews. We store the current theme here,
     /// and if previewing is cancelled, we can return to it.
@@ -957,8 +1076,10 @@ pub struct Editor {
     /// This cache is only a performance optimization to
     /// avoid calculating the cursor position multiple
     /// times during rendering and should not be set by other functions.
-    pub cursor_cache: Cell<Option<Option<Position>>>,
     pub handlers: Handlers,
+
+    pub mouse_down_range: Option<Range>,
+    pub cursor_cache: CursorCache,
 }
 
 pub type Motion = Box<dyn Fn(&mut Editor)>;
@@ -967,7 +1088,7 @@ pub type Motion = Box<dyn Fn(&mut Editor)>;
 pub enum EditorEvent {
     DocumentSaved(DocumentSavedEventResult),
     ConfigEvent(ConfigEvent),
-    LanguageServerMessage((usize, Call)),
+    LanguageServerMessage((LanguageServerId, Call)),
     DebuggerEvent(dap::Payload),
     IdleTimer,
     Redraw,
@@ -1027,7 +1148,7 @@ impl Editor {
     pub fn new(
         mut area: Rect,
         theme_loader: Arc<theme::Loader>,
-        syn_loader: Arc<syntax::Loader>,
+        syn_loader: Arc<ArcSwap<syntax::Loader>>,
         config: Arc<dyn DynAccess<Config>>,
         handlers: Handlers,
     ) -> Self {
@@ -1073,8 +1194,9 @@ impl Editor {
             exit_code: 0,
             config_events: unbounded_channel(),
             needs_redraw: false,
-            cursor_cache: Cell::new(None),
             handlers,
+            mouse_down_range: None,
+            cursor_cache: CursorCache::default(),
         }
     }
 
@@ -1147,7 +1269,7 @@ impl Editor {
     #[inline]
     pub fn set_error<T: Into<Cow<'static, str>>>(&mut self, error: T) {
         let error = error.into();
-        log::error!("editor error: {}", error);
+        log::debug!("editor error: {}", error);
         self.status_msg = Some((error, Severity::Error));
     }
 
@@ -1188,7 +1310,7 @@ impl Editor {
         }
 
         let scopes = theme.scopes();
-        self.syn_loader.set_scopes(scopes.to_vec());
+        (*self.syn_loader).load().set_scopes(scopes.to_vec());
 
         match preview {
             ThemeAction::Preview => {
@@ -1206,13 +1328,103 @@ impl Editor {
     }
 
     #[inline]
-    pub fn language_server_by_id(&self, language_server_id: usize) -> Option<&helix_lsp::Client> {
-        self.language_servers.get_by_id(language_server_id)
+    pub fn language_server_by_id(
+        &self,
+        language_server_id: LanguageServerId,
+    ) -> Option<&helix_lsp::Client> {
+        self.language_servers
+            .get_by_id(language_server_id)
+            .map(|client| &**client)
     }
 
     /// Refreshes the language server for a given document
     pub fn refresh_language_servers(&mut self, doc_id: DocumentId) {
         self.launch_language_servers(doc_id)
+    }
+
+    /// moves/renames a path, invoking any event handlers (currently only lsp)
+    /// and calling `set_doc_path` if the file is open in the editor
+    pub fn move_path(&mut self, old_path: &Path, new_path: &Path) -> io::Result<()> {
+        let new_path = canonicalize(new_path);
+        // sanity check
+        if old_path == new_path {
+            return Ok(());
+        }
+        let is_dir = old_path.is_dir();
+        let language_servers: Vec<_> = self
+            .language_servers
+            .iter_clients()
+            .filter(|client| client.is_initialized())
+            .cloned()
+            .collect();
+        for language_server in language_servers {
+            let Some(request) = language_server.will_rename(old_path, &new_path, is_dir) else {
+                continue;
+            };
+            let edit = match helix_lsp::block_on(request) {
+                Ok(edit) => edit,
+                Err(err) => {
+                    log::error!("invalid willRename response: {err:?}");
+                    continue;
+                }
+            };
+            if let Err(err) = self.apply_workspace_edit(language_server.offset_encoding(), &edit) {
+                log::error!("failed to apply workspace edit: {err:?}")
+            }
+        }
+        fs::rename(old_path, &new_path)?;
+        if let Some(doc) = self.document_by_path(old_path) {
+            self.set_doc_path(doc.id(), &new_path);
+        }
+        let is_dir = new_path.is_dir();
+        for ls in self.language_servers.iter_clients() {
+            if let Some(notification) = ls.did_rename(old_path, &new_path, is_dir) {
+                tokio::spawn(notification);
+            };
+        }
+        self.language_servers
+            .file_event_handler
+            .file_changed(old_path.to_owned());
+        self.language_servers
+            .file_event_handler
+            .file_changed(new_path);
+        Ok(())
+    }
+
+    pub fn set_doc_path(&mut self, doc_id: DocumentId, path: &Path) {
+        let doc = doc_mut!(self, &doc_id);
+        let old_path = doc.path();
+
+        if let Some(old_path) = old_path {
+            // sanity check, should not occur but some callers (like an LSP) may
+            // create bogus calls
+            if old_path == path {
+                return;
+            }
+            // if we are open in LSPs send did_close notification
+            for language_server in doc.language_servers() {
+                tokio::spawn(language_server.text_document_did_close(doc.identifier()));
+            }
+        }
+        // we need to clear the list of language servers here so that
+        // refresh_doc_language/refresh_language_servers doesn't resend
+        // text_document_did_close. Since we called `text_document_did_close`
+        // we have fully unregistered this document from its LS
+        doc.language_servers.clear();
+        doc.set_path(Some(path));
+        self.refresh_doc_language(doc_id)
+    }
+
+    pub fn refresh_doc_language(&mut self, doc_id: DocumentId) {
+        let loader = self.syn_loader.clone();
+        let doc = doc_mut!(self, &doc_id);
+        doc.detect_language(loader);
+        doc.detect_indent_and_line_ending();
+        self.refresh_language_servers(doc_id);
+        let doc = doc_mut!(self, &doc_id);
+        let diagnostics = Editor::doc_diagnostics(&self.language_servers, &self.diagnostics, doc);
+        doc.replace_diagnostics(diagnostics, &[], None);
+        doc.reset_all_inlay_hints();
     }
 
     /// Launch a language server for a given document
@@ -1238,19 +1450,26 @@ impl Editor {
                 .filter_map(|(lang, client)| match client {
                     Ok(client) => Some((lang, client)),
                     Err(err) => {
-                        log::error!(
-                            "Failed to initialize the language servers for `{}` - `{}` {{ {} }}",
-                            language.scope(),
-                            lang,
-                            err
-                        );
+                        if let helix_lsp::Error::ExecutableNotFound(err) = err {
+                            // Silence by default since some language servers might just not be installed
+                            log::debug!(
+                                "Language server not found for `{}` {} {}", language.scope(), lang, err,
+                            );
+                        } else {
+                            log::error!(
+                                "Failed to initialize the language servers for `{}` - `{}` {{ {} }}",
+                                language.scope(),
+                                lang,
+                                err
+                            );
+                        }
                         None
                     }
                 })
                 .collect::<HashMap<_, _>>()
         });
 
-        if language_servers.is_empty() {
+        if language_servers.is_empty() && doc.language_servers.is_empty() {
             return;
         }
 
@@ -1331,7 +1550,9 @@ impl Editor {
             return;
         }
 
-        self.enter_normal_mode();
+        if !matches!(action, Action::Load) {
+            self.enter_normal_mode();
+        }
 
         match action {
             Action::Replace => {
@@ -1466,7 +1687,7 @@ impl Editor {
     }
 
     // ??? possible use for integration tests
-    pub fn open(&mut self, path: &Path, action: Action) -> Result<DocumentId, Error> {
+    pub fn open(&mut self, path: &Path, action: Action) -> Result<DocumentId, DocumentOpenError> {
         let path = helix_stdx::path::canonicalize(path);
         let id = self.document_by_path(&path).map(|doc| doc.id);
 
@@ -1716,7 +1937,7 @@ impl Editor {
     /// Returns all supported diagnostics for the document
     pub fn doc_diagnostics<'a>(
         language_servers: &'a helix_lsp::Registry,
-        diagnostics: &'a BTreeMap<lsp::Url, Vec<(lsp::Diagnostic, usize)>>,
+        diagnostics: &'a BTreeMap<Uri, Vec<(lsp::Diagnostic, LanguageServerId)>>,
         document: &Document,
     ) -> impl Iterator<Item = helix_core::Diagnostic> + 'a {
         Editor::doc_diagnostics_with_filter(language_servers, diagnostics, document, |_, _| true)
@@ -1726,16 +1947,14 @@ impl Editor {
     /// filtered by `filter` which is invocated with the raw `lsp::Diagnostic` and the language server id it came from
     pub fn doc_diagnostics_with_filter<'a>(
         language_servers: &'a helix_lsp::Registry,
-        diagnostics: &'a BTreeMap<lsp::Url, Vec<(lsp::Diagnostic, usize)>>,
-
+        diagnostics: &'a BTreeMap<Uri, Vec<(lsp::Diagnostic, LanguageServerId)>>,
         document: &Document,
-        filter: impl Fn(&lsp::Diagnostic, usize) -> bool + 'a,
+        filter: impl Fn(&lsp::Diagnostic, LanguageServerId) -> bool + 'a,
     ) -> impl Iterator<Item = helix_core::Diagnostic> + 'a {
         let text = document.text().clone();
         let language_config = document.language.clone();
         document
-            .path()
-            .and_then(|path| url::Url::from_file_path(path).ok()) // TODO log error?
+            .uri()
             .and_then(|uri| diagnostics.get(&uri))
             .map(|diags| {
                 diags.iter().filter_map(move |(diagnostic, lsp_id)| {
@@ -1772,15 +1991,7 @@ impl Editor {
     pub fn cursor(&self) -> (Option<Position>, CursorKind) {
         let config = self.config();
         let (view, doc) = current_ref!(self);
-        let cursor = doc
-            .selection(view.id)
-            .primary()
-            .cursor(doc.text().slice(..));
-        let pos = self
-            .cursor_cache
-            .get()
-            .unwrap_or_else(|| view.screen_coords_at_pos(doc, doc.text().slice(..), cursor));
-        if let Some(mut pos) = pos {
+        if let Some(mut pos) = self.cursor_cache.get(view, doc) {
             let inner = view.inner_area(doc);
             pos.col += inner.x as usize;
             pos.row += inner.y as usize;
@@ -1882,7 +2093,7 @@ impl Editor {
 
     /// Switches the editor into normal mode.
     pub fn enter_normal_mode(&mut self) {
-        use helix_core::{graphemes, Range};
+        use helix_core::graphemes;
 
         if self.mode == Mode::Normal {
             return;
@@ -1897,10 +2108,12 @@ impl Editor {
         if doc.restore_cursor {
             let text = doc.text().slice(..);
             let selection = doc.selection(view.id).clone().transform(|range| {
-                Range::new(
-                    range.from(),
-                    graphemes::prev_grapheme_boundary(text, range.to()),
-                )
+                let mut head = range.to();
+                if range.head > range.anchor {
+                    head = graphemes::prev_grapheme_boundary(text, head);
+                }
+
+                Range::new(range.from(), head)
             });
 
             doc.set_selection(view.id, selection);
@@ -1971,5 +2184,30 @@ fn try_restore_indent(doc: &mut Document, view: &mut View) {
                 (line_start_pos, pos, None)
             });
         doc.apply(&transaction, view.id);
+    }
+}
+
+#[derive(Default)]
+pub struct CursorCache(Cell<Option<Option<Position>>>);
+
+impl CursorCache {
+    pub fn get(&self, view: &View, doc: &Document) -> Option<Position> {
+        if let Some(pos) = self.0.get() {
+            return pos;
+        }
+
+        let text = doc.text().slice(..);
+        let cursor = doc.selection(view.id).primary().cursor(text);
+        let res = view.screen_coords_at_pos(doc, text, cursor);
+        self.set(res);
+        res
+    }
+
+    pub fn set(&self, cursor_pos: Option<Position>) {
+        self.0.set(Some(cursor_pos))
+    }
+
+    pub fn reset(&self) {
+        self.0.set(None)
     }
 }

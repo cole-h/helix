@@ -4,13 +4,14 @@ use helix_core::{diagnostic::Severity, pos_at_coords, syntax, Selection};
 use helix_lsp::{
     lsp::{self, notification::Notification},
     util::lsp_range_to_range,
-    LspProgressMap,
+    LanguageServerId, LspProgressMap,
 };
 use helix_stdx::path::get_relative_path;
 use helix_view::{
     align_view,
-    document::DocumentSavedEventResult,
+    document::{DocumentOpenError, DocumentSavedEventResult},
     editor::{ConfigEvent, EditorEvent},
+    events::DiagnosticsDidChange,
     graphics::Rect,
     theme,
     tree::Layout,
@@ -21,7 +22,6 @@ use tui::backend::Backend;
 
 use crate::{
     args::Args,
-    commands::apply_workspace_edit,
     compositor::{Compositor, Event},
     config::Config,
     handlers,
@@ -67,7 +67,7 @@ pub struct Application {
     #[allow(dead_code)]
     theme_loader: Arc<theme::Loader>,
     #[allow(dead_code)]
-    syn_loader: Arc<syntax::Loader>,
+    syn_loader: Arc<ArcSwap<syntax::Loader>>,
 
     signals: Signals,
     jobs: Jobs,
@@ -97,11 +97,7 @@ fn setup_integration_logging() {
 }
 
 impl Application {
-    pub fn new(
-        args: Args,
-        config: Config,
-        syn_loader_conf: syntax::Configuration,
-    ) -> Result<Self, Error> {
+    pub fn new(args: Args, config: Config, lang_loader: syntax::Loader) -> Result<Self, Error> {
         #[cfg(feature = "integration")]
         setup_integration_logging();
 
@@ -127,7 +123,7 @@ impl Application {
             })
             .unwrap_or_else(|| theme_loader.default_theme(true_color));
 
-        let syn_loader = std::sync::Arc::new(syntax::Loader::new(syn_loader_conf));
+        let syn_loader = Arc::new(ArcSwap::from_pointee(lang_loader));
 
         #[cfg(not(feature = "integration"))]
         let backend = CrosstermBackend::new(stdout(), &config.editor);
@@ -191,9 +187,15 @@ impl Application {
                             Some(Layout::Horizontal) => Action::HorizontalSplit,
                             None => Action::Load,
                         };
-                        let doc_id = editor
-                            .open(&file, action)
-                            .context(format!("open '{}'", file.to_string_lossy()))?;
+                        let doc_id = match editor.open(&file, action) {
+                            // Ignore irregular files during application init.
+                            Err(DocumentOpenError::IrregularFile) => {
+                                nr_of_files -= 1;
+                                continue;
+                            }
+                            Err(err) => return Err(anyhow::anyhow!(err)),
+                            Ok(doc_id) => doc_id,
+                        };
                         // with Action::Load all documents have the same view
                         // NOTE: this isn't necessarily true anymore. If
                         // `--vsplit` or `--hsplit` are used, the file which is
@@ -204,15 +206,21 @@ impl Application {
                         doc.set_selection(view_id, pos);
                     }
                 }
-                editor.set_status(format!(
-                    "Loaded {} file{}.",
-                    nr_of_files,
-                    if nr_of_files == 1 { "" } else { "s" } // avoid "Loaded 1 files." grammo
-                ));
-                // align the view to center after all files are loaded,
-                // does not affect views without pos since it is at the top
-                let (view, doc) = current!(editor);
-                align_view(doc, view, Align::Center);
+
+                // if all files were invalid, replace with empty buffer
+                if nr_of_files == 0 {
+                    editor.new_file(Action::VerticalSplit);
+                } else {
+                    editor.set_status(format!(
+                        "Loaded {} file{}.",
+                        nr_of_files,
+                        if nr_of_files == 1 { "" } else { "s" } // avoid "Loaded 1 files." grammo
+                    ));
+                    // align the view to center after all files are loaded,
+                    // does not affect views without pos since it is at the top
+                    let (view, doc) = current!(editor);
+                    align_view(doc, view, Align::Center);
+                }
             } else {
                 editor.new_file(Action::VerticalSplit);
             }
@@ -283,7 +291,7 @@ impl Application {
         self.compositor.render(area, surface, &mut cx);
         let (pos, kind) = self.compositor.cursor(area, &self.editor);
         // reset cursor cache
-        self.editor.cursor_cache.set(None);
+        self.editor.cursor_cache.reset();
 
         let pos = pos.map(|pos| (pos.col as u16, pos.row as u16));
         self.terminal.draw(pos, kind).unwrap();
@@ -395,10 +403,9 @@ impl Application {
 
     /// refresh language config after config change
     fn refresh_language_config(&mut self) -> Result<(), Error> {
-        let syntax_config = helix_core::config::user_syntax_loader()
-            .map_err(|err| anyhow::anyhow!("Failed to load language config: {}", err))?;
+        let lang_loader = helix_core::config::user_lang_loader()?;
 
-        self.syn_loader = std::sync::Arc::new(syntax::Loader::new(syntax_config));
+        self.syn_loader.store(Arc::new(lang_loader));
         self.editor.syn_loader = self.syn_loader.clone();
         for document in self.editor.documents.values_mut() {
             document.detect_language(self.syn_loader.clone());
@@ -573,26 +580,8 @@ impl Application {
         let lines = doc_save_event.text.len_lines();
         let bytes = doc_save_event.text.len_bytes();
 
-        if doc.path() != Some(&doc_save_event.path) {
-            doc.set_path(Some(&doc_save_event.path));
-
-            let loader = self.editor.syn_loader.clone();
-
-            // borrowing the same doc again to get around the borrow checker
-            let doc = doc_mut!(self.editor, &doc_save_event.doc_id);
-            let id = doc.id();
-            doc.detect_language(loader);
-            self.editor.refresh_language_servers(id);
-            // and again a borrow checker workaround...
-            let doc = doc_mut!(self.editor, &doc_save_event.doc_id);
-            let diagnostics = Editor::doc_diagnostics(
-                &self.editor.language_servers,
-                &self.editor.diagnostics,
-                doc,
-            );
-            doc.replace_diagnostics(diagnostics, &[], None);
-        }
-
+        self.editor
+            .set_doc_path(doc_save_event.doc_id, &doc_save_event.path);
         // TODO: fix being overwritten by lsp
         self.editor.set_status(format!(
             "'{}' written, {}L {}B",
@@ -679,7 +668,7 @@ impl Application {
     pub async fn handle_language_server_message(
         &mut self,
         call: helix_lsp::Call,
-        server_id: usize,
+        server_id: LanguageServerId,
     ) {
         use helix_lsp::{Call, MethodCall, Notification};
 
@@ -747,10 +736,10 @@ impl Application {
                         }
                     }
                     Notification::PublishDiagnostics(mut params) => {
-                        let path = match params.uri.to_file_path() {
-                            Ok(path) => path,
-                            Err(_) => {
-                                log::error!("Unsupported file URI: {}", params.uri);
+                        let uri = match helix_core::Uri::try_from(params.uri) {
+                            Ok(uri) => uri,
+                            Err(err) => {
+                                log::error!("{err}");
                                 return;
                             }
                         };
@@ -761,11 +750,11 @@ impl Application {
                         }
                         // have to inline the function because of borrow checking...
                         let doc = self.editor.documents.values_mut()
-                            .find(|doc| doc.path().map(|p| p == &path).unwrap_or(false))
+                            .find(|doc| doc.uri().is_some_and(|u| u == uri))
                             .filter(|doc| {
                                 if let Some(version) = params.version {
                                     if version != doc.version() {
-                                        log::info!("Version ({version}) is out of date for {path:?} (expected ({}), dropping PublishDiagnostic notification", doc.version());
+                                        log::info!("Version ({version}) is out of date for {uri:?} (expected ({}), dropping PublishDiagnostic notification", doc.version());
                                         return false;
                                     }
                                 }
@@ -777,15 +766,13 @@ impl Application {
                             let lang_conf = doc.language.clone();
 
                             if let Some(lang_conf) = &lang_conf {
-                                if let Some(old_diagnostics) =
-                                    self.editor.diagnostics.get(&params.uri)
-                                {
+                                if let Some(old_diagnostics) = self.editor.diagnostics.get(&uri) {
                                     if !lang_conf.persistent_diagnostic_sources.is_empty() {
                                         // Sort diagnostics first by severity and then by line numbers.
                                         // Note: The `lsp::DiagnosticSeverity` enum is already defined in decreasing order
                                         params
                                             .diagnostics
-                                            .sort_unstable_by_key(|d| (d.severity, d.range.start));
+                                            .sort_by_key(|d| (d.severity, d.range.start));
                                     }
                                     for source in &lang_conf.persistent_diagnostic_sources {
                                         let new_diagnostics = params
@@ -812,7 +799,7 @@ impl Application {
                         // Insert the original lsp::Diagnostics here because we may have no open document
                         // for diagnosic message and so we can't calculate the exact position.
                         // When using them later in the diagnostics picker, we calculate them on-demand.
-                        let diagnostics = match self.editor.diagnostics.entry(params.uri) {
+                        let diagnostics = match self.editor.diagnostics.entry(uri) {
                             Entry::Occupied(o) => {
                                 let current_diagnostics = o.into_mut();
                                 // there may entries of other language servers, which is why we can't overwrite the whole entry
@@ -826,9 +813,8 @@ impl Application {
 
                         // Sort diagnostics first by severity and then by line numbers.
                         // Note: The `lsp::DiagnosticSeverity` enum is already defined in decreasing order
-                        diagnostics.sort_unstable_by_key(|(d, server_id)| {
-                            (d.severity, d.range.start, *server_id)
-                        });
+                        diagnostics
+                            .sort_by_key(|(d, server_id)| (d.severity, d.range.start, *server_id));
 
                         if let Some(doc) = doc {
                             let diagnostic_of_language_server_and_not_in_unchanged_sources =
@@ -849,6 +835,12 @@ impl Application {
                                 &unchanged_diag_sources,
                                 Some(server_id),
                             );
+
+                            let doc = doc.id();
+                            helix_event::dispatch(DiagnosticsDidChange {
+                                editor: &mut self.editor,
+                                doc,
+                            });
                         }
                     }
                     Notification::ShowMessage(params) => {
@@ -1011,11 +1003,9 @@ impl Application {
                         let language_server = language_server!();
                         if language_server.is_initialized() {
                             let offset_encoding = language_server.offset_encoding();
-                            let res = apply_workspace_edit(
-                                &mut self.editor,
-                                offset_encoding,
-                                &params.edit,
-                            );
+                            let res = self
+                                .editor
+                                .apply_workspace_edit(offset_encoding, &params.edit);
 
                             Ok(json!(lsp::ApplyWorkspaceEditResponse {
                                 applied: res.is_ok(),
@@ -1058,12 +1048,7 @@ impl Application {
                         Ok(json!(result))
                     }
                     Ok(MethodCall::RegisterCapability(params)) => {
-                        if let Some(client) = self
-                            .editor
-                            .language_servers
-                            .iter_clients()
-                            .find(|client| client.id() == server_id)
-                        {
+                        if let Some(client) = self.editor.language_servers.get_by_id(server_id) {
                             for reg in params.registrations {
                                 match reg.method.as_str() {
                                     lsp::notification::DidChangeWatchedFiles::METHOD => {
@@ -1153,20 +1138,22 @@ impl Application {
             ..
         } = params;
 
-        let path = match uri.to_file_path() {
-            Ok(path) => path,
+        let uri = match helix_core::Uri::try_from(uri) {
+            Ok(uri) => uri,
             Err(err) => {
-                log::error!("unsupported file URI: {}: {:?}", uri, err);
+                log::error!("{err}");
                 return lsp::ShowDocumentResult { success: false };
             }
         };
+        // If `Uri` gets another variant other than `Path` this may not be valid.
+        let path = uri.as_path().expect("URIs are valid paths");
 
         let action = match take_focus {
             Some(true) => helix_view::editor::Action::Replace,
             _ => helix_view::editor::Action::VerticalSplit,
         };
 
-        let doc_id = match self.editor.open(&path, action) {
+        let doc_id = match self.editor.open(path, action) {
             Ok(id) => id,
             Err(err) => {
                 log::error!("failed to open path: {:?}: {:?}", uri, err);

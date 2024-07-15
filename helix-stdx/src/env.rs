@@ -1,4 +1,5 @@
 use std::{
+    ffi::OsStr,
     path::{Path, PathBuf},
     sync::RwLock,
 };
@@ -13,13 +14,23 @@ pub fn current_working_dir() -> PathBuf {
         return path.clone();
     }
 
-    let path = std::env::current_dir()
-        .map(crate::path::normalize)
-        .expect("Couldn't determine current working directory");
-    let mut cwd = CWD.write().unwrap();
-    *cwd = Some(path.clone());
+    // implementation of crossplatform pwd -L
+    // we want pwd -L so that symlinked directories are handled correctly
+    let mut cwd = std::env::current_dir().expect("Couldn't determine current working directory");
 
-    path
+    let pwd = std::env::var_os("PWD");
+    #[cfg(windows)]
+    let pwd = pwd.or_else(|| std::env::var_os("CD"));
+
+    if let Some(pwd) = pwd.map(PathBuf::from) {
+        if pwd.canonicalize().ok().as_ref() == Some(&cwd) {
+            cwd = pwd;
+        }
+    }
+    let mut dst = CWD.write().unwrap();
+    *dst = Some(cwd.clone());
+
+    cwd
 }
 
 pub fn set_current_working_dir(path: impl AsRef<Path>) -> std::io::Result<()> {
@@ -29,6 +40,38 @@ pub fn set_current_working_dir(path: impl AsRef<Path>) -> std::io::Result<()> {
     *cwd = Some(path);
     Ok(())
 }
+
+pub fn env_var_is_set(env_var_name: &str) -> bool {
+    std::env::var_os(env_var_name).is_some()
+}
+
+pub fn binary_exists<T: AsRef<OsStr>>(binary_name: T) -> bool {
+    which::which(binary_name).is_ok()
+}
+
+pub fn which<T: AsRef<OsStr>>(
+    binary_name: T,
+) -> Result<std::path::PathBuf, ExecutableNotFoundError> {
+    let binary_name = binary_name.as_ref();
+    which::which(binary_name).map_err(|err| ExecutableNotFoundError {
+        command: binary_name.to_string_lossy().into_owned(),
+        inner: err,
+    })
+}
+
+#[derive(Debug)]
+pub struct ExecutableNotFoundError {
+    command: String,
+    inner: which::Error,
+}
+
+impl std::fmt::Display for ExecutableNotFoundError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "command '{}' not found: {}", self.command, self.inner)
+    }
+}
+
+impl std::error::Error for ExecutableNotFoundError {}
 
 #[cfg(test)]
 mod tests {

@@ -1,19 +1,15 @@
 use std::fmt::Display;
 
 use crate::{
-    match_brackets::find_matching_bracket, movement::Direction, search, Range, Selection, Syntax,
+    graphemes::next_grapheme_boundary,
+    match_brackets::{
+        find_matching_bracket, find_matching_bracket_fuzzy, get_pair, is_close_bracket,
+        is_open_bracket,
+    },
+    movement::Direction,
+    search, Range, Selection, Syntax,
 };
 use ropey::RopeSlice;
-
-pub const PAIRS: &[(char, char)] = &[
-    ('(', ')'),
-    ('[', ']'),
-    ('{', '}'),
-    ('<', '>'),
-    ('«', '»'),
-    ('「', '」'),
-    ('（', '）'),
-];
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Error {
@@ -36,32 +32,68 @@ impl Display for Error {
 
 type Result<T> = std::result::Result<T, Error>;
 
-/// Given any char in [PAIRS], return the open and closing chars. If not found in
-/// [PAIRS] return (ch, ch).
+/// Finds the position of surround pairs of any [`crate::match_brackets::PAIRS`]
+/// using tree-sitter when possible.
 ///
-/// ```
-/// use helix_core::surround::get_pair;
+/// # Returns
 ///
-/// assert_eq!(get_pair('['), ('[', ']'));
-/// assert_eq!(get_pair('}'), ('{', '}'));
-/// assert_eq!(get_pair('"'), ('"', '"'));
-/// ```
-pub fn get_pair(ch: char) -> (char, char) {
-    PAIRS
-        .iter()
-        .find(|(open, close)| *open == ch || *close == ch)
-        .copied()
-        .unwrap_or((ch, ch))
+/// Tuple `(anchor, head)`, meaning it is not always ordered.
+pub fn find_nth_closest_pairs_pos(
+    syntax: Option<&Syntax>,
+    text: RopeSlice,
+    range: Range,
+    skip: usize,
+) -> Result<(usize, usize)> {
+    match syntax {
+        Some(syntax) => find_nth_closest_pairs_ts(syntax, text, range, skip),
+        None => find_nth_closest_pairs_plain(text, range, skip),
+    }
 }
 
-pub fn find_nth_closest_pairs_pos(
+fn find_nth_closest_pairs_ts(
+    syntax: &Syntax,
     text: RopeSlice,
     range: Range,
     mut skip: usize,
 ) -> Result<(usize, usize)> {
-    let is_open_pair = |ch| PAIRS.iter().any(|(open, _)| *open == ch);
-    let is_close_pair = |ch| PAIRS.iter().any(|(_, close)| *close == ch);
+    let mut opening = range.from();
+    // We want to expand the selection if we are already on the found pair,
+    // otherwise we would need to subtract "-1" from "range.to()".
+    let mut closing = range.to();
 
+    while skip > 0 {
+        closing = find_matching_bracket_fuzzy(syntax, text, closing).ok_or(Error::PairNotFound)?;
+        opening = find_matching_bracket(syntax, text, closing).ok_or(Error::PairNotFound)?;
+        // If we're already on a closing bracket "find_matching_bracket_fuzzy" will return
+        // the position of the opening bracket.
+        if closing < opening {
+            (opening, closing) = (closing, opening);
+        }
+
+        // In case found brackets are partially inside current selection.
+        if range.from() < opening || closing < range.to() - 1 {
+            closing = next_grapheme_boundary(text, closing);
+        } else {
+            skip -= 1;
+            if skip != 0 {
+                closing = next_grapheme_boundary(text, closing);
+            }
+        }
+    }
+
+    // Keep the original direction.
+    if let Direction::Forward = range.direction() {
+        Ok((opening, closing))
+    } else {
+        Ok((closing, opening))
+    }
+}
+
+fn find_nth_closest_pairs_plain(
+    text: RopeSlice,
+    range: Range,
+    mut skip: usize,
+) -> Result<(usize, usize)> {
     let mut stack = Vec::with_capacity(2);
     let pos = range.from();
     let mut close_pos = pos.saturating_sub(1);
@@ -69,7 +101,7 @@ pub fn find_nth_closest_pairs_pos(
     for ch in text.chars_at(pos) {
         close_pos += 1;
 
-        if is_open_pair(ch) {
+        if is_open_bracket(ch) {
             // Track open pairs encountered so that we can step over
             // the corresponding close pairs that will come up further
             // down the loop. We want to find a lone close pair whose
@@ -78,7 +110,7 @@ pub fn find_nth_closest_pairs_pos(
             continue;
         }
 
-        if !is_close_pair(ch) {
+        if !is_close_bracket(ch) {
             // We don't care if this character isn't a brace pair item,
             // so short circuit here.
             continue;
@@ -126,7 +158,6 @@ pub fn find_nth_closest_pairs_pos(
 /// or opening pair. `n` will skip n - 1 pairs (eg. n=2 will discard (only)
 /// the first pair found and keep looking)
 pub fn find_nth_pairs_pos(
-    syntax: Option<&Syntax>,
     text: RopeSlice,
     ch: char,
     range: Range,
@@ -144,26 +175,15 @@ pub fn find_nth_pairs_pos(
 
     let (open, close) = if open == close {
         if Some(open) == text.get_char(pos) {
-            // Cursor is directly on match char and we don't have any tree-sitter syntax available
-            // to help identify the matching pair. We return no match because there's no way to know
-            // which side of the char we should be searching on.
-            let syntax = syntax.ok_or(Error::CursorOnAmbiguousPair)?;
-
-            let match_pos = find_matching_bracket(syntax, text.into(), pos)
-                .ok_or(Error::CursorOnAmbiguousPair)?;
-            let close_char = text.char(match_pos);
-            let search_pos = pos.max(match_pos);
-
-            (
-                search::find_nth_prev(text, open, search_pos, n),
-                search::find_nth_next(text, close_char, search_pos, n),
-            )
-        } else {
-            (
-                search::find_nth_prev(text, open, pos, n),
-                search::find_nth_next(text, close, pos, n),
-            )
+            // Cursor is directly on match char. We return no match
+            // because there's no way to know which side of the char
+            // we should be searching on.
+            return Err(Error::CursorOnAmbiguousPair);
         }
+        (
+            search::find_nth_prev(text, open, pos, n),
+            search::find_nth_next(text, close, pos, n),
+        )
     } else {
         (
             find_nth_open_pair(text, open, close, pos, n),
@@ -171,7 +191,11 @@ pub fn find_nth_pairs_pos(
         )
     };
 
-    Option::zip(open, close).ok_or(Error::PairNotFound)
+    // preserve original direction
+    match range.direction() {
+        Direction::Forward => Option::zip(open, close).ok_or(Error::PairNotFound),
+        Direction::Backward => Option::zip(close, open).ok_or(Error::PairNotFound),
+    }
 }
 
 fn find_nth_open_pair(
@@ -181,6 +205,10 @@ fn find_nth_open_pair(
     mut pos: usize,
     n: usize,
 ) -> Option<usize> {
+    if pos >= text.len_chars() {
+        return None;
+    }
+
     let mut chars = text.chars_at(pos + 1);
 
     // Adjusts pos for the first iteration, and handles the case of the
@@ -268,14 +296,19 @@ pub fn get_surround_pos(
     let mut change_pos = Vec::new();
 
     for &range in selection {
-        let (open_pos, close_pos) = match ch {
-            Some(ch) => find_nth_pairs_pos(syntax, text, ch, range, skip)?,
-            None => find_nth_closest_pairs_pos(text, range, skip)?,
+        let (open_pos, close_pos) = {
+            let range_raw = match ch {
+                Some(ch) => find_nth_pairs_pos(text, ch, range, skip)?,
+                None => find_nth_closest_pairs_pos(syntax, text, range, skip)?,
+            };
+            let range = Range::new(range_raw.0, range_raw.1);
+            (range.from(), range.to())
         };
         if change_pos.contains(&open_pos) || change_pos.contains(&close_pos) {
             return Err(Error::CursorOverlap);
         }
-        change_pos.extend_from_slice(&[open_pos, close_pos]);
+        // ensure the positions are always paired in the forward direction
+        change_pos.extend_from_slice(&[open_pos.min(close_pos), close_pos.max(open_pos)]);
     }
     Ok(change_pos)
 }
@@ -359,7 +392,7 @@ mod test {
 
         assert_eq!(2, expectations.len());
         assert_eq!(
-            find_nth_pairs_pos(None, doc.slice(..), '\'', selection.primary(), 1)
+            find_nth_pairs_pos(doc.slice(..), '\'', selection.primary(), 1)
                 .expect("find should succeed"),
             (expectations[0], expectations[1])
         )
@@ -376,7 +409,7 @@ mod test {
 
         assert_eq!(2, expectations.len());
         assert_eq!(
-            find_nth_pairs_pos(None, doc.slice(..), '\'', selection.primary(), 2)
+            find_nth_pairs_pos(doc.slice(..), '\'', selection.primary(), 2)
                 .expect("find should succeed"),
             (expectations[0], expectations[1])
         )
@@ -392,8 +425,23 @@ mod test {
             );
 
         assert_eq!(
-            find_nth_pairs_pos(None, doc.slice(..), '\'', selection.primary(), 1),
+            find_nth_pairs_pos(doc.slice(..), '\'', selection.primary(), 1),
             Err(Error::CursorOnAmbiguousPair)
+        )
+    }
+
+    #[test]
+    fn test_find_nth_closest_pairs_pos_index_range_panic() {
+        #[rustfmt::skip]
+        let (doc, selection, _) =
+            rope_with_selections_and_expectations(
+                "(a)c)",
+                "^^^^^"
+            );
+
+        assert_eq!(
+            find_nth_closest_pairs_pos(None, doc.slice(..), selection.primary(), 1),
+            Err(Error::PairNotFound)
         )
     }
 

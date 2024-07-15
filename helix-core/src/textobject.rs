@@ -228,9 +228,8 @@ fn textobject_pair_surround_impl(
     count: usize,
 ) -> Range {
     let pair_pos = match ch {
-        Some(ch) => surround::find_nth_pairs_pos(syntax, slice, ch, range, count),
-        // Automatically find the closest surround pairs
-        None => surround::find_nth_closest_pairs_pos(slice, range, count),
+        Some(ch) => surround::find_nth_pairs_pos(slice, ch, range, count),
+        None => surround::find_nth_closest_pairs_pos(syntax, slice, range, count),
     };
     pair_pos
         .map(|(anchor, head)| match textobject {
